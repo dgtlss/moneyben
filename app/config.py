@@ -60,6 +60,7 @@ class Config:
     min_trade_usd: float = _float("MIN_TRADE_USD", 10.0)            # skip dust trades
     min_cash_reserve_usd: float = _float("MIN_CASH_RESERVE_USD", 100.0)  # never spend below this
     min_confidence: float = _float("MIN_CONFIDENCE", 0.6)          # ignore low-conviction LLM calls
+    liquidate_on_shutdown: bool = _bool("LIQUIDATE_ON_SHUTDOWN", True)  # sell all to cash when stopping
 
     # --- Coinbase (only required when real_trading is True) ---
     # The EC private key is often pasted with literal "\n"; normalize to real

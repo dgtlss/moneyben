@@ -62,6 +62,40 @@ def fmt_holding(product: str, base: float, value: float) -> str:
     return f"{amount} {product.split('-')[0]} ({fmt_money(value)})"
 
 
+def fmt_pnl(change: float, base: float) -> str:
+    """Plain-English profit/loss, e.g. '📈 up $1.20 (+0.01%)'."""
+    pct = (change / base * 100) if base else 0.0
+    if abs(change) < 0.01:
+        return "no change"
+    if change > 0:
+        return f"📈 up {fmt_money(change)} ({pct:+.2f}%)"
+    return f"📉 down {fmt_money(abs(change))} ({pct:+.2f}%)"
+
+
+def fmt_duration(seconds: float) -> str:
+    secs = int(seconds)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def fetch_prices(md: MarketData, cfg: Config) -> dict[str, float]:
+    """Best-effort spot price for every product (skips any that fail)."""
+    prices: dict[str, float] = {}
+    for product in cfg.products:
+        try:
+            px = md.price(product)
+            if px:
+                prices[product] = px
+        except Exception:
+            pass
+    return prices
+
+
 def _stop(signum, _frame):
     global _running
     log.info("\n👋 Stopping after this round. Your money is safe and saved.")
@@ -133,18 +167,77 @@ def run_cycle(cfg: Config, md: MarketData, llm: LLMClient, pf: Portfolio, trader
     pf.ensure_baseline(total)
 
     # Plain-English profit/loss since the bot started.
-    change = total - (pf.start_value or total)
-    pct = (change / pf.start_value * 100) if pf.start_value else 0.0
-    if abs(change) < 0.01:
-        pnl = "no change yet"
-    elif change > 0:
-        pnl = f"📈 up {fmt_money(change)} ({pct:+.2f}%)"
-    else:
-        pnl = f"📉 down {fmt_money(abs(change))} ({pct:+.2f}%)"
-
+    pnl = fmt_pnl(total - (pf.start_value or total), pf.start_value or total)
     coins_value = total - final["cash_usd"]
     log.info("  💰 Your money: %s total  =  %s cash  +  %s in coins   ·   %s",
              fmt_money(total), fmt_money(final["cash_usd"]), fmt_money(coins_value), pnl)
+
+
+def liquidate_all(cfg: Config, md: MarketData, pf: Portfolio, trader: Trader) -> None:
+    """Sell every open position back to cash before the bot goes offline.
+
+    Runs once on shutdown so positions aren't left held (and untracked)
+    overnight. Bypasses the per-trade and confidence limits on purpose — this
+    is a deliberate full exit, not a strategy decision.
+    """
+    # Fresh prices for anything we might hold.
+    prices = fetch_prices(md, cfg)
+
+    # Real mode: act on the exchange's actual balances, not our cached ledger.
+    if cfg.real_trading and trader.trade_client:
+        try:
+            pf.sync_from_balances(trader.trade_client.balances(), prices, cfg.products)
+        except Exception:
+            log.info("  Couldn't reach the exchange to cash out — your balances are untouched.")
+            return
+
+    held = [p for p in cfg.products if pf.base_held(p) > 0]
+    if not held:
+        return
+
+    log.info("\n🧹 Cashing out before shutdown so nothing's left held while offline...")
+    for product in held:
+        price = prices.get(product) or pf.positions.get(product, {}).get("avg_price", 0.0)
+        outcome = trader.liquidate(product, price)
+        if outcome:
+            log.info("  %-10s → %s", coin_name(product), outcome)
+    pf.save()
+    final = pf.snapshot(prices)
+    log.info("  💰 All in cash now: %s", fmt_money(final["cash_usd"]))
+
+
+def session_report(cfg: Config, md: MarketData, pf: Portfolio,
+                   started_at: datetime, start_value: float, start_trade_count: int) -> None:
+    """Print a summary of the session on quit: what we did and where we sit."""
+    prices = fetch_prices(md, cfg)
+    final = pf.snapshot(prices)
+    total = final["total_value_usd"]
+
+    new_trades = pf.trades[start_trade_count:]
+    buys = [t for t in new_trades if t["action"] == "BUY"]
+    sells = [t for t in new_trades if t["action"] == "SELL"]
+    bought = sum(t["usd"] for t in buys)
+    sold = sum(t["usd"] for t in sells)
+
+    duration = fmt_duration((datetime.now() - started_at).total_seconds())
+
+    log.info("\n════════════════ Session summary ════════════════")
+    log.info("  Ran for:          %s", duration)
+    if new_trades:
+        log.info("  Trades made:      %d  (%d buys %s, %d sells %s)",
+                 len(new_trades), len(buys), fmt_money(bought), len(sells), fmt_money(sold))
+    else:
+        log.info("  Trades made:      none — sat tight all session")
+    log.info("  This session:     %s", fmt_pnl(total - start_value, start_value))
+    held = final["positions"]
+    if held:
+        coins = ", ".join(f"{coin_name(p)} {fmt_money(v['value_usd'])}" for p, v in held.items())
+        log.info("  Ending balance:   %s  (%s cash + %s)",
+                 fmt_money(total), fmt_money(final["cash_usd"]), coins)
+    else:
+        log.info("  Ending balance:   %s  (all in cash)", fmt_money(total))
+    log.info("  Since you began:  %s", fmt_pnl(total - (pf.start_value or total), pf.start_value or total))
+    log.info("═════════════════════════════════════════════════")
 
 
 def main() -> int:
@@ -188,6 +281,11 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    # Baseline for the end-of-session report.
+    session_started = datetime.now()
+    session_start_value = pf.total_value(fetch_prices(md, cfg))
+    session_trade_start = len(pf.trades)
+
     while _running:
         cycle_start = time.time()
         try:
@@ -201,6 +299,17 @@ def main() -> int:
         while _running and slept < to_sleep:
             time.sleep(min(1.0, to_sleep - slept))
             slept += 1.0
+
+    if cfg.liquidate_on_shutdown:
+        try:
+            liquidate_all(cfg, md, pf, trader)
+        except Exception as e:
+            log.exception("Couldn't fully cash out on shutdown: %s", e)
+
+    try:
+        session_report(cfg, md, pf, session_started, session_start_value, session_trade_start)
+    except Exception as e:
+        log.exception("Couldn't print the session summary: %s", e)
 
     return 0
 

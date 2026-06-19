@@ -92,3 +92,23 @@ class Trader:
                 return f"SELL failed at the exchange — nothing happened ({result['raw']})"
         self.pf.apply_sell(product, base_to_sell, price)
         return f"SOLD ${base_to_sell * price:,.2f} worth 💵  ({decision.reason})"
+
+    def liquidate(self, product: str, price: float) -> str:
+        """Sell the entire position back to cash, ignoring per-trade/confidence caps.
+
+        Used on shutdown so nothing is left held while the bot is offline.
+        Returns a short phrase, or "" if there was nothing to sell.
+        """
+        held_base = self.pf.base_held(product)
+        if held_base <= 0:
+            return ""
+        if price <= 0:
+            return "couldn't sell — no price available (still held)"
+
+        if self.trade_client:  # real mode
+            result = self.trade_client.market_sell(product, held_base)
+            if not result["success"]:
+                return f"SELL failed at the exchange — still held ({result['raw']})"
+        proceeds = held_base * price
+        self.pf.apply_sell(product, held_base, price)
+        return f"SOLD everything — ${proceeds:,.2f} back to cash 💵"
