@@ -1,0 +1,10 @@
+.env
+coinbase.txt
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.DS_Store
+README.md

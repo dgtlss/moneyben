@@ -1,0 +1,12 @@
+services:
+  moneyben:
+    build: .
+    container_name: moneyben
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    # Trading needs no inbound ports. Logs via `docker compose logs -f`.
