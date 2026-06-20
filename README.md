@@ -1,94 +1,118 @@
 # moneyben
 
-A Dockerized crypto trading bot. Every minute it pulls live market data from
-Coinbase, asks an LLM (via [OpenRouter](https://openrouter.ai)) for a buy/sell/hold
-decision per market, then executes within hard-coded risk limits.
+A Dockerized Trading 212 stock/ETF bot. Each cycle it syncs your Trading 212
+account, pulls watchlist market data from Alpha Vantage, asks an LLM (via
+[OpenRouter](https://openrouter.ai)) for a buy/sell/hold decision per ticker,
+and then clamps every trade through hard risk limits before sending a broker
+order.
 
-**Defaults to paper trading** — it simulates trades against real prices and places
-no real orders until you explicitly enable `REAL_TRADING=true`.
+**Defaults to Trading 212 demo mode** via `T212_ENV=demo`, so the same broker
+flow can be exercised without touching live funds.
+Set `READ_ONLY=true` if you want full decision-making and logging without
+placing even demo orders.
 
 ## How it works
 
-```
+```text
  every INTERVAL_SECONDS:
-   Coinbase public API ──► 1m candles + spot price
-                            │
-                            ▼
-                     indicators (SMA/EMA/RSI/volatility/momentum)
-                            │
-        portfolio snapshot ─┤
-                            ▼
-                   OpenRouter LLM ──► {action, size_usd, confidence} per product
-                            │
-                            ▼
-                   Trader: clamp to risk limits ──► paper ledger OR real order
-                            │
-                            ▼
-                   persist /data/portfolio.json + log P&L
+   Trading 212 demo/live ──► account summary + positions + instrument metadata
+   Alpha Vantage         ──► candles + latest price
+                              │
+                              ▼
+                       indicators (SMA/EMA/RSI/volatility/momentum)
+                              │
+          portfolio snapshot ─┤
+                              ▼
+                     OpenRouter LLM ──► {action, size_usd, confidence} per ticker
+                              │
+                              ▼
+                     Trader: clamp risk -> convert USD to share quantity
+                              │
+                              ▼
+                     Trading 212 market order + local audit log
 ```
 
-- **Market data is public** — paper mode needs *zero* Coinbase credentials.
-- **One LLM call per cycle** for all products, to keep cost predictable.
-- **The LLM never has final say.** `app/trader.py` clamps every decision against
-  `MAX_POSITION_USD`, `MAX_TRADE_USD`, `MIN_CASH_RESERVE_USD`, etc. A bogus
-  "BUY $1,000,000" becomes a safe bounded order or a no-op.
+- Trading is **market-hours aware** using Trading 212 exchange metadata.
+- The LLM gets **one batched call per cycle** for all configured tickers.
+- The LLM never has final say. `app/trader.py` enforces `MAX_POSITION_USD`,
+  `MAX_TRADE_USD`, `MIN_CASH_RESERVE_USD`, confidence thresholds, and stale-price
+  checks before any order is sent.
 
-## Quick start (paper trading)
+## Quick start
 
 ```bash
 cp .env.example .env
-# edit .env: set OPENROUTER_API_KEY (leave REAL_TRADING=false)
+# edit .env with your OpenRouter, Trading 212, and Alpha Vantage keys
+# set READ_ONLY=true for the safest first run
 
 docker compose up --build
-docker compose logs -f         # watch decisions roll in
+docker compose logs -f
 ```
 
-The simulated ledger persists to `./data/portfolio.json`.
+The local file at `./data/portfolio.json` is an audit/cache artifact. Trading
+212 demo/live remains the source of truth for balances and positions.
 
-## Going live (real money)
+## Going live
 
-> ⚠️ This places real market orders with real funds. Start with tiny limits.
+> This places real market orders with real funds. Start tiny and stay in demo
+> until you trust the behavior.
 
-1. Create a Coinbase **Advanced Trade / CDP API key** with trade permission.
-2. In `.env`:
-   ```
-   REAL_TRADING=true
-   COINBASE_API_KEY=organizations/.../apiKeys/...
-   COINBASE_API_SECRET="-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----\n"
+1. Create a Trading 212 API key/secret for an eligible `Invest` or `Stocks ISA`
+   account.
+2. Update `.env`:
+   ```bash
+   T212_ENV=live
+   READ_ONLY=false
    MAX_TRADE_USD=20
    MAX_POSITION_USD=50
    ```
-3. `docker compose up --build -d`
-
-In real mode the bot syncs cash/positions from your live Coinbase balances each
-cycle; the local file is just an audit log of trades it placed.
+3. Restart the container:
+   ```bash
+   docker compose up --build -d
+   ```
 
 ## Configuration
 
-All knobs are environment variables (see `.env.example`). Key ones:
+Key environment variables:
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `REAL_TRADING` | `false` | Place real orders vs. simulate |
-| `PRODUCTS` | `BTC-USD,ETH-USD,SOL-USD` | Markets to trade |
-| `OPENROUTER_MODEL` | `anthropic/claude-haiku-4.5` | Any OpenRouter model id |
-| `INTERVAL_SECONDS` | `60` | Cycle cadence (min 10) |
-| `MAX_POSITION_USD` | `1000` | Cap on $ held per product |
-| `MAX_TRADE_USD` | `250` | Cap on $ per single order |
+| `T212_ENV` | `demo` | Trading 212 environment: `demo` or `live` |
+| `TICKERS` | `AAPL_US_EQ,MSFT_US_EQ,SPY_US_EQ` | Trading 212 instruments to watch/trade |
+| `READ_ONLY` | `false` | Run the full strategy loop without placing broker orders |
+| `MARKET_DATA_PROVIDER` | `alpha_vantage` | External market data backend |
+| `INTERVAL_SECONDS` | `60` | Cycle cadence (minimum 10 seconds) |
+| `MAX_POSITION_USD` | `1000` | Cap on dollar exposure per ticker |
+| `MAX_TRADE_USD` | `250` | Cap on dollar value per order |
 | `MIN_CASH_RESERVE_USD` | `100` | Cash floor never spent below |
 | `MIN_CONFIDENCE` | `0.6` | Ignore lower-confidence LLM actions |
-| `PAPER_START_CASH` | `10000` | Starting paper balance |
+| `EXTENDED_HOURS` | `false` | Allow pre/post-market orders when available |
+| `LIQUIDATE_ON_SHUTDOWN` | `false` | Reserved for future flatten-on-stop behavior |
 
 ## Running without Docker
 
 ```bash
 pip install -r requirements.txt
 export OPENROUTER_API_KEY=sk-or-...
-DATA_DIR=./data python -m app.main
+export T212_DEMO_API_KEY=...
+export T212_DEMO_API_SECRET=...
+export MARKET_DATA_API_KEY=...
+export READ_ONLY=true
+DATA_DIR=./data python3 -m app.main
 ```
+
+## Notes
+
+- Trading 212’s public API covers account summary, instruments, exchanges,
+  positions, and orders.
+- This repo uses a separate market-data provider because the published Trading
+  212 docs do not expose the candle pipeline this bot uses for indicators.
+- Alpha Vantage intraday data may require the appropriate entitlement for the
+  freshness you want.
 
 ## Disclaimer
 
-This is experimental software for education and research. Crypto trading is
-risky and you can lose money. An LLM is not a financial advisor. Run paper mode
-for a long time before risking real funds, and use small limits. No warranty.
+This is experimental software for education and research. Trading stocks and
+ETFs is risky and you can lose money. An LLM is not a financial advisor. Run in
+demo mode for a long time before risking real funds, and use small limits. No
+warranty.

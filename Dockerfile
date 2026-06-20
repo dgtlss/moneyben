@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Persisted ledger lives here (mount a volume over it).
+# Local audit/cache data lives here (mount a volume over it).
 RUN mkdir -p /data
 VOLUME ["/data"]
 

@@ -1,114 +1,134 @@
-"""Risk enforcement + execution.
-
-The LLM proposes; the Trader disposes. Every decision is clamped against the
-config risk limits here, so a hallucinated 'BUY $1,000,000' becomes a safe,
-bounded order (or a no-op). This is the only place orders are placed.
-"""
+"""Risk enforcement + Trading 212 order execution."""
 from __future__ import annotations
 
 import logging
+import math
+from datetime import datetime, timezone
 
-from .config import Config
-from .coinbase_client import TradeClient
-from .llm import Decision
 from .portfolio import Portfolio
 
 log = logging.getLogger("trader")
 
 
 class Trader:
-    def __init__(self, cfg: Config, portfolio: Portfolio, trade_client: TradeClient | None):
+    def __init__(self, cfg, portfolio: Portfolio, broker):
         self.cfg = cfg
         self.pf = portfolio
-        self.trade_client = trade_client  # None in paper mode
+        self.broker = broker
 
-    def execute(self, decision: Decision, price: float) -> str:
-        """Validate, clamp, and (maybe) place an order.
-
-        Returns a short, plain-English phrase describing what happened (the
-        caller prepends the coin name and price).
-        """
-        product = decision.product
-        action = decision.action
-        cfg = self.cfg
+    def execute(self, decision, price: float, price_as_of: datetime | None = None) -> str:
+        product = decision.get("product", "")
+        action = str(decision.get("action", "HOLD")).upper()
+        confidence = float(decision.get("confidence", 0.0) or 0.0)
+        reason = str(decision.get("reason", ""))
+        requested = float(decision.get("size_usd", 0.0) or 0.0)
 
         if action == "HOLD":
             return "waiting — no clear opportunity right now"
-
-        if decision.confidence < cfg.min_confidence:
+        if confidence < self.cfg.min_confidence:
             return "waiting — not confident enough to trade yet"
-
         if price <= 0:
-            return "waiting — couldn't get a price"
-
+            return "waiting — couldn't get a usable price"
+        if self._is_stale(price_as_of):
+            return "waiting — price data is stale, so no order was sent"
         if action == "BUY":
-            return self._buy(product, decision, price)
+            return self._buy(product, requested, price, reason)
         if action == "SELL":
-            return self._sell(product, decision, price)
+            return self._sell(product, requested, price, reason)
         return "waiting — no action"
 
-    def _buy(self, product: str, decision: Decision, price: float) -> str:
-        cfg = self.cfg
-        requested = decision.size_usd
+    def _is_stale(self, price_as_of: datetime | None) -> bool:
+        if price_as_of is None:
+            return False
+        now = datetime.now(timezone.utc)
+        return (now - price_as_of).total_seconds() > self.cfg.max_price_age_seconds
 
-        # Clamp to per-trade cap.
-        spend = min(requested, cfg.max_trade_usd)
+    def _buy(self, ticker: str, requested_usd: float, price: float, reason: str) -> str:
+        spend = min(requested_usd, self.cfg.max_trade_usd)
+        spend = min(spend, max(0.0, self.cfg.max_position_usd - self.pf.position_value(ticker, price)))
+        spend = min(spend, max(0.0, self.pf.cash - self.cfg.min_cash_reserve_usd))
+        if spend < self.cfg.min_trade_usd:
+            return "wanted to BUY, but a safety limit stopped it"
 
-        # Respect the per-position cap.
-        room = cfg.max_position_usd - self.pf.position_value(product, price)
-        spend = min(spend, max(0.0, room))
+        quantity = self._rounded_quantity(spend / price)
+        if quantity <= 0:
+            return "wanted to BUY, but the share quantity rounded to zero"
 
-        # Respect cash + reserve.
-        spendable_cash = self.pf.cash - cfg.min_cash_reserve_usd
-        spend = min(spend, max(0.0, spendable_cash))
+        if self.cfg.read_only:
+            self.pf.record_order(
+                ticker=ticker,
+                side="BUY",
+                quantity=quantity,
+                requested_value=spend,
+                price=price,
+                status="READ_ONLY",
+                reason=reason,
+                order_id=None,
+            )
+            return f"READ-ONLY — would BUY about ${spend:,.2f} ({quantity:.4f} shares) ({reason})"
 
-        if spend < cfg.min_trade_usd:
-            return "wanted to BUY, but a safety limit stopped it (your cash is untouched)"
+        result = self.broker.place_market_order(ticker, quantity, extended_hours=self.cfg.extended_hours)
+        self.pf.record_order(
+            ticker=ticker,
+            side="BUY",
+            quantity=quantity,
+            requested_value=spend,
+            price=price,
+            status=result.status,
+            reason=reason,
+            order_id=result.id,
+        )
+        return self._describe_result("BUY", spend, quantity, result, reason)
 
-        if self.trade_client:  # real mode
-            result = self.trade_client.market_buy(product, spend)
-            if not result["success"]:
-                return f"BUY failed at the exchange — nothing happened ({result['raw']})"
-        self.pf.apply_buy(product, spend, price)
-        return f"BOUGHT ${spend:,.2f} worth ✅  ({decision.reason})"
-
-    def _sell(self, product: str, decision: Decision, price: float) -> str:
-        cfg = self.cfg
-        held_base = self.pf.base_held(product)
-        if held_base <= 0:
+    def _sell(self, ticker: str, requested_usd: float, price: float, reason: str) -> str:
+        held_qty = self.pf.quantity_held(ticker)
+        if held_qty <= 0:
             return "wanted to SELL, but you don't own any right now"
 
-        held_usd = held_base * price
-        # How many USD of the position to sell, clamped to per-trade cap.
-        sell_usd = min(decision.size_usd or held_usd, cfg.max_trade_usd, held_usd)
-        if sell_usd < cfg.min_trade_usd and sell_usd < held_usd:
-            return "wanted to SELL, but the amount was too small (a safety limit)"
+        held_value = held_qty * price
+        sell_usd = min(requested_usd or held_value, self.cfg.max_trade_usd, held_value)
+        if sell_usd < self.cfg.min_trade_usd and sell_usd < held_value:
+            return "wanted to SELL, but the amount was too small"
 
-        base_to_sell = min(sell_usd / price, held_base)
+        quantity = self._rounded_quantity(min(sell_usd / price, held_qty))
+        if quantity <= 0:
+            return "wanted to SELL, but the share quantity rounded to zero"
 
-        if self.trade_client:  # real mode
-            result = self.trade_client.market_sell(product, base_to_sell)
-            if not result["success"]:
-                return f"SELL failed at the exchange — nothing happened ({result['raw']})"
-        self.pf.apply_sell(product, base_to_sell, price)
-        return f"SOLD ${base_to_sell * price:,.2f} worth 💵  ({decision.reason})"
+        if self.cfg.read_only:
+            self.pf.record_order(
+                ticker=ticker,
+                side="SELL",
+                quantity=-quantity,
+                requested_value=sell_usd,
+                price=price,
+                status="READ_ONLY",
+                reason=reason,
+                order_id=None,
+            )
+            return f"READ-ONLY — would SELL about ${sell_usd:,.2f} ({quantity:.4f} shares) ({reason})"
 
-    def liquidate(self, product: str, price: float) -> str:
-        """Sell the entire position back to cash, ignoring per-trade/confidence caps.
+        result = self.broker.place_market_order(ticker, -quantity, extended_hours=self.cfg.extended_hours)
+        self.pf.record_order(
+            ticker=ticker,
+            side="SELL",
+            quantity=-quantity,
+            requested_value=sell_usd,
+            price=price,
+            status=result.status,
+            reason=reason,
+            order_id=result.id,
+        )
+        return self._describe_result("SELL", sell_usd, quantity, result, reason)
 
-        Used on shutdown so nothing is left held while the bot is offline.
-        Returns a short phrase, or "" if there was nothing to sell.
-        """
-        held_base = self.pf.base_held(product)
-        if held_base <= 0:
-            return ""
-        if price <= 0:
-            return "couldn't sell — no price available (still held)"
+    def _rounded_quantity(self, quantity: float) -> float:
+        precision = 10 ** self.cfg.quantity_precision
+        return math.trunc(quantity * precision) / precision
 
-        if self.trade_client:  # real mode
-            result = self.trade_client.market_sell(product, held_base)
-            if not result["success"]:
-                return f"SELL failed at the exchange — still held ({result['raw']})"
-        proceeds = held_base * price
-        self.pf.apply_sell(product, held_base, price)
-        return f"SOLD everything — ${proceeds:,.2f} back to cash 💵"
+    @staticmethod
+    def _describe_result(action: str, usd_value: float, quantity: float, result, reason: str) -> str:
+        status = (result.status or "").upper()
+        if status in {"REJECTED", "CANCELLED"}:
+            return f"{action} failed at the broker — nothing happened ({status})"
+        if status in {"FILLED", "PARTIALLY_FILLED"}:
+            return f"{action} order filled for about ${usd_value:,.2f} ({quantity:.4f} shares) ({reason})"
+        return f"{action} order queued for about ${usd_value:,.2f} ({quantity:.4f} shares) ({reason})"
