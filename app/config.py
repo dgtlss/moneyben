@@ -67,6 +67,13 @@ def _t212_credential(kind: str) -> str:
     return os.environ.get(f"T212_{kind}", "")
 
 
+def _default_market_data_base_url() -> str:
+    provider = os.environ.get("MARKET_DATA_PROVIDER", "alpha_vantage").strip().lower()
+    if provider == "twelve_data":
+        return "https://api.twelvedata.com"
+    return "https://www.alphavantage.co/query"
+
+
 @dataclass(frozen=True)
 class Config:
     tickers: list[str] = field(default_factory=lambda: _list("TICKERS", ["AAPL_US_EQ", "MSFT_US_EQ", "SPY_US_EQ"]))
@@ -94,7 +101,7 @@ class Config:
 
     market_data_provider: str = field(default_factory=lambda: os.environ.get("MARKET_DATA_PROVIDER", "alpha_vantage").strip().lower())
     market_data_api_key: str = field(default_factory=lambda: os.environ.get("MARKET_DATA_API_KEY", ""))
-    market_data_base_url: str = field(default_factory=lambda: os.environ.get("MARKET_DATA_BASE_URL", "https://www.alphavantage.co/query").rstrip("/"))
+    market_data_base_url: str = field(default_factory=lambda: os.environ.get("MARKET_DATA_BASE_URL", _default_market_data_base_url()).rstrip("/"))
     market_data_symbols: dict[str, str] = field(default_factory=lambda: _mapping("MARKET_DATA_SYMBOLS"))
 
     openrouter_api_key: str = field(default_factory=lambda: os.environ.get("OPENROUTER_API_KEY", ""))
@@ -116,10 +123,10 @@ class Config:
             errors.append("T212_ENV must be either 'demo' or 'live'.")
         if not (self.t212_api_key and self.t212_api_secret):
             errors.append("T212_API_KEY and T212_API_SECRET are required.")
-        if self.market_data_provider not in {"alpha_vantage"}:
-            errors.append("MARKET_DATA_PROVIDER must be 'alpha_vantage'.")
-        if self.market_data_provider == "alpha_vantage" and not self.market_data_api_key:
-            errors.append("MARKET_DATA_API_KEY is required for MARKET_DATA_PROVIDER=alpha_vantage.")
+        if self.market_data_provider not in {"alpha_vantage", "twelve_data"}:
+            errors.append("MARKET_DATA_PROVIDER must be 'alpha_vantage' or 'twelve_data'.")
+        if self.market_data_provider in {"alpha_vantage", "twelve_data"} and not self.market_data_api_key:
+            errors.append(f"MARKET_DATA_API_KEY is required for MARKET_DATA_PROVIDER={self.market_data_provider}.")
         if not self.openrouter_api_key:
             errors.append("OPENROUTER_API_KEY is required.")
         if self.interval_seconds < 10:

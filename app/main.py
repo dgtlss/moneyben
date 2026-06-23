@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from .config import Config
 from .indicators import summarize
 from .llm import LLMClient
-from .market_data import AlphaVantageMarketData
+from .market_data import build_market_data_client
 from .portfolio import Portfolio
 from .schedules import instrument_is_tradable
 from .trader import Trader
@@ -55,16 +55,19 @@ def gather_market(cfg, market_data, open_tickers: list[str]) -> tuple[dict, dict
     market: dict = {}
     prices: dict[str, tuple[float, datetime | None]] = {}
     for ticker in open_tickers:
-        candles = market_data.candles(ticker, cfg.candle_lookback)
-        if not candles:
-            continue
-        closes = [float(candle["close"]) for candle in candles]
-        price, price_as_of = market_data.price(ticker)
-        spot = price or closes[-1]
-        summary = summarize(closes)
-        summary["spot"] = round(spot, 6)
-        market[ticker] = summary
-        prices[ticker] = (spot, price_as_of)
+        try:
+            candles = market_data.candles(ticker, cfg.candle_lookback)
+            if not candles:
+                continue
+            closes = [float(candle["close"]) for candle in candles]
+            price, price_as_of = market_data.price(ticker)
+            spot = price or closes[-1]
+            summary = summarize(closes)
+            summary["spot"] = round(spot, 6)
+            market[ticker] = summary
+            prices[ticker] = (spot, price_as_of)
+        except Exception as exc:
+            log.info("  %-12s market data unavailable — %s", ticker, exc)
     return market, prices
 
 
@@ -124,7 +127,7 @@ def main() -> int:
             log.error("CONFIG: %s", error)
         return 1
 
-    market_data = AlphaVantageMarketData(cfg)
+    market_data = build_market_data_client(cfg)
     llm = LLMClient(cfg.openrouter_api_key, cfg.openrouter_model, cfg.openrouter_base_url)
     portfolio = Portfolio(os.path.join(cfg.data_dir, "portfolio.json"), quote_currency=cfg.quote_currency)
     trader = Trader(cfg, portfolio, broker)

@@ -17,6 +17,20 @@ def make_cfg():
 
 
 class MainCycleTests(unittest.TestCase):
+    def test_gather_market_logs_provider_errors_per_ticker(self):
+        from app.main import gather_market
+
+        cfg = SimpleNamespace(candle_lookback=120)
+        market_data = Mock()
+        market_data.candles.side_effect = RuntimeError("Alpha Vantage said premium endpoint")
+
+        with self.assertLogs("moneyben", level="INFO") as logs:
+            market, prices = gather_market(cfg, market_data, ["AAPL_US_EQ"])
+
+        self.assertEqual(market, {})
+        self.assertEqual(prices, {})
+        self.assertTrue(any("premium endpoint" in line for line in logs.output))
+
     def test_run_cycle_skips_llm_and_orders_when_market_closed(self):
         from app.main import run_cycle
         from app.portfolio import Portfolio

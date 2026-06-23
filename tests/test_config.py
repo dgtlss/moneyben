@@ -43,6 +43,19 @@ class ConfigTests(unittest.TestCase):
 
         self.assertTrue(cfg.read_only)
 
+    def test_validate_accepts_twelve_data_provider(self):
+        cfg = load_config(
+            {
+                "OPENROUTER_API_KEY": "sk-or-test",
+                "T212_API_KEY": "live-key",
+                "T212_API_SECRET": "live-secret",
+                "MARKET_DATA_PROVIDER": "twelve_data",
+                "MARKET_DATA_API_KEY": "twelve-key",
+            }
+        )
+
+        self.assertEqual(cfg.validate(), [])
+
     def test_tickers_preserve_case(self):
         cfg = load_config(
             {

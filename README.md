@@ -1,7 +1,7 @@
 # moneyben
 
 A Dockerized Trading 212 stock/ETF bot. Each cycle it syncs your Trading 212
-account, pulls watchlist market data from Alpha Vantage, asks an LLM (via
+account, pulls watchlist market data from a configurable provider such as Twelve Data, asks an LLM (via
 [OpenRouter](https://openrouter.ai)) for a buy/sell/hold decision per ticker,
 and then clamps every trade through hard risk limits before sending a broker
 order.
@@ -16,7 +16,7 @@ placing even demo orders.
 ```text
  every INTERVAL_SECONDS:
    Trading 212 demo/live ──► account summary + positions + instrument metadata
-   Alpha Vantage         ──► candles + latest price
+   Twelve Data / provider ──► candles + latest price
                               │
                               ▼
                        indicators (SMA/EMA/RSI/volatility/momentum)
@@ -42,7 +42,7 @@ placing even demo orders.
 
 ```bash
 cp .env.example .env
-# edit .env with your OpenRouter, Trading 212, and Alpha Vantage keys
+# edit .env with your OpenRouter, Trading 212, and market-data keys
 # set READ_ONLY=true for the safest first run
 
 docker compose up --build
@@ -80,7 +80,7 @@ Key environment variables:
 | `T212_ENV` | `demo` | Trading 212 environment: `demo` or `live` |
 | `TICKERS` | `AAPL_US_EQ,MSFT_US_EQ,SPY_US_EQ` | Trading 212 instruments to watch/trade |
 | `READ_ONLY` | `false` | Run the full strategy loop without placing broker orders |
-| `MARKET_DATA_PROVIDER` | `alpha_vantage` | External market data backend |
+| `MARKET_DATA_PROVIDER` | `twelve_data` | External market data backend |
 | `INTERVAL_SECONDS` | `60` | Cycle cadence (minimum 10 seconds) |
 | `MAX_POSITION_USD` | `1000` | Cap on dollar exposure per ticker |
 | `MAX_TRADE_USD` | `250` | Cap on dollar value per order |
@@ -107,8 +107,8 @@ DATA_DIR=./data python3 -m app.main
   positions, and orders.
 - This repo uses a separate market-data provider because the published Trading
   212 docs do not expose the candle pipeline this bot uses for indicators.
-- Alpha Vantage intraday data may require the appropriate entitlement for the
-  freshness you want.
+- Some non-US Trading 212 tickers may need `MARKET_DATA_SYMBOLS` overrides to
+  match the provider's symbol naming, for example `HASl_EQ:HAS.LON`.
 
 ## Disclaimer
 
